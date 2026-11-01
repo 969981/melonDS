@@ -98,7 +98,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: upstream-master
+          ref: ${{ needs.sync.outputs.sha }}
           persist-credentials: false
       - uses: actions/cache@v4
         with:
@@ -147,7 +147,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: upstream-master
+          ref: ${{ needs.sync.outputs.sha }}
           persist-credentials: false
       - name: Install official Ubuntu dependencies
         run: |
@@ -198,7 +198,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: upstream-master
+          ref: ${{ needs.sync.outputs.sha }}
           persist-credentials: false
       - name: Install upstream macOS packaging dependencies
         run: |

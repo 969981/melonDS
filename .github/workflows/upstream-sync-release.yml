@@ -13,7 +13,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: melonds-official-upstream-sync-release
+  group: melonds-official-upstream-sync-release-v2
   cancel-in-progress: false
 
 jobs:
@@ -73,9 +73,6 @@ jobs:
           if gh release view "$tag" >/dev/null 2>&1; then
             echo "build=false" >> "$GITHUB_OUTPUT"
             echo "Release $tag already exists. No build."
-          elif [[ "$old" == "$sha" && "${{ github.event_name }}" == "schedule" ]]; then
-            echo "build=false" >> "$GITHUB_OUTPUT"
-            echo "Unchanged upstream, scheduled check skips rebuilding failed snapshots."
           else
             echo "build=true" >> "$GITHUB_OUTPUT"
             echo "Building snapshot for upstream commit $sha"
@@ -188,7 +185,7 @@ jobs:
     name: macOS Apple Silicon (upstream vcpkg preset)
     needs: sync
     if: needs.sync.outputs.build == 'true'
-    runs-on: macos-15-arm64
+    runs-on: macos-15
     timeout-minutes: 240
     env:
       MELONDS_GIT_BRANCH: master

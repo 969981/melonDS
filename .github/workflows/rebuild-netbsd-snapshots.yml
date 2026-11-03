@@ -1,0 +1,104 @@
+name: Repair NetBSD packages for melonDS upstream and CHN snapshots
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - '.github/workflows/rebuild-netbsd-snapshots.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  netbsd:
+    name: NetBSD x86_64 (${{ matrix.channel }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - channel: upstream
+            sha: 1e654443e4c0a54b40709c0208aa0eeba41e6142
+            tag: melonds-upstream-1e654443e4c0
+          - channel: chn
+            sha: cb2cc1d244b6a9d9ad61b48cd29c5a639c254c01
+            tag: melonds-chn-cb2cc1d244b6
+    env:
+      MELONDS_GIT_BRANCH: ${{ matrix.channel }}
+      MELONDS_GIT_HASH: ${{ matrix.sha }}
+      MELONDS_BUILD_PROVIDER: GitHub Actions (unofficial rebuilt NetBSD snapshot)
+    defaults:
+      run:
+        shell: netbsd {0}
+    steps:
+      - name: Checkout exact upstream SHA
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.sha }}
+          persist-credentials: false
+      - name: Start NetBSD VM with real X11 distribution sets
+        uses: jenseng/dynamic-uses@v1
+        with:
+          uses: vmactions/netbsd-vm@v1
+          with: >-
+            {
+              "arch": "x86_64",
+              "envs": "MELONDS_GIT_BRANCH MELONDS_GIT_HASH MELONDS_BUILD_PROVIDER",
+              "prepare": "set -eu; /usr/sbin/pkg_add pkgin curl; mach=$(uname -m); case \"$mach\" in x86_64) mach=amd64 ;; esac; root=https://ftp.netbsd.org/pub/NetBSD/NetBSD-$(uname -r)/$mach/binary/sets; for set in xbase xcomp; do curl -fL --retry 3 --connect-timeout 15 --max-time 180 -o /tmp/$set.tar.xz $root/$set.tar.xz; tar xJpf /tmp/$set.tar.xz -C /; done; test -f /usr/X11R7/lib/libX11.so.7",
+              "sync": "nfs",
+              "usesh": "true"
+            }
+      - name: Install Qt6 and compiler dependencies
+        run: |
+          if ! pkgin -y install cmake extra-cmake-modules pkgconf ninja-build qt6-qtbase qt6-qtmultimedia qt6-qtsvg SDL2 libarchive zstd enet faad2; then
+            cat /var/db/pkgin/pkg_install-err.log || true
+            exit 1
+          fi
+          test -f /usr/X11R7/lib/libX11.so.7
+      - name: Build and check NetBSD binary
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          cmake -B build -G Ninja -DMELONDS_EMBED_BUILD_INFO=ON
+          cmake --build build --parallel 3
+          test -s build/melonDS
+      - name: Package successful NetBSD build
+        shell: bash
+        env:
+          TAG: ${{ matrix.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist/stage
+          test -s build/melonDS
+          cp build/melonDS dist/stage/melonDS
+          cp LICENSE dist/stage/LICENSE
+          (cd dist/stage && zip -q "../melonDS-$TAG-netbsd-x86_64.zip" melonDS LICENSE)
+          test -s "dist/melonDS-$TAG-netbsd-x86_64.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: netbsd-fixed-${{ matrix.channel }}
+          path: dist/*.zip
+          if-no-files-found: error
+          retention-days: 7
+      - name: Merge NetBSD package and regenerate release SHA256
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ matrix.tag }}
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" --repo "$GH_REPO" >/dev/null
+          mkdir -p dist/published
+          gh release download "$TAG" --repo "$GH_REPO" --dir dist/published --pattern "melonDS-$TAG-*" || true
+          cp "dist/melonDS-$TAG-netbsd-x86_64.zip" dist/published/
+          cd dist/published
+          shopt -s nullglob
+          files=(melonDS-"$TAG"-*.zip melonDS-"$TAG"-*.tar.gz)
+          if (( ${#files[@]} == 0 )); then exit 1; fi
+          for f in "${files[@]}"; do test -s "$f"; done
+          sha256sum "${files[@]}" > SHA256SUMS.txt
+          sha256sum -c SHA256SUMS.txt
+          gh release upload "$TAG" --repo "$GH_REPO" "melonDS-$TAG-netbsd-x86_64.zip" SHA256SUMS.txt --clobber
+          echo "Uploaded NetBSD build and updated checksums for $TAG" >> "$GITHUB_STEP_SUMMARY"

@@ -488,12 +488,24 @@ jobs:
           - os: netbsd
             os_name: NetBSD
             prepare_vm: |
+              set -eu
               /usr/sbin/pkg_add pkgin curl
-              mach=$(uname -m | sed "s/evbarm/evbarm-$(uname -p)/")
+              mach="$(uname -m)"
+              case "$mach" in
+                x86_64) mach=amd64 ;;
+                aarch64) mach=evbarm-aarch64 ;;
+              esac
+              root="https://ftp.netbsd.org/pub/NetBSD/NetBSD-$(uname -r)/$mach/binary/sets"
               for set in xbase xcomp; do
-                curl -sL ${PKG_PATH%%/pkgsrc*}/NetBSD/NetBSD-$(uname -r
-                  )/$mach/binary/sets/$set.tar.xz | tar xJpf - -C /
+                echo "Downloading official NetBSD $set set from $root"
+                curl -fL --retry 3 --connect-timeout 15 --max-time 180 \
+                  -o "/tmp/$set.tar.xz" "$root/$set.tar.xz"
+                tar -xJpf "/tmp/$set.tar.xz" -C /
               done
+              test -f /usr/X11R7/lib/libX11.so.7 || {
+                echo "NetBSD X11 libraries are still missing"
+                exit 1
+              }
             install_deps: >-
               pkgin -y install cmake extra-cmake-modules pkgconf
               ninja-build qt6-qtbase qt6-qtmultimedia qt6-qtsvg SDL2
@@ -529,7 +541,14 @@ jobs:
               "usesh": "true"
             }
       - name: Install dependencies
-        run: ${{ matrix.install_deps }}
+        run: |
+          if ! ( ${{ matrix.install_deps }} ); then
+            if [ "${{ matrix.os }}" = netbsd ]; then
+              echo "NetBSD package dependency details:"
+              cat /var/db/pkgin/pkg_install-err.log || true
+            fi
+            exit 1
+          fi
       - name: Configure and compile
         run: |
           cd "$GITHUB_WORKSPACE"
@@ -555,15 +574,70 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
+  publish-early:
+    name: Publish initial official Ubuntu snapshot
+    needs: [sync, linux]
+    if: needs.sync.outputs.build == 'true' && needs.linux.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: melonds-linux-x64
+          path: dist
+      - name: Publish verified Ubuntu packages without waiting for slow platforms
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.sync.outputs.tag }}
+          SHA: ${{ needs.sync.outputs.sha }}
+        run: |
+          set -euo pipefail
+          cd dist
+          shopt -s nullglob
+          files=(melonDS-"$TAG"-*.tar.gz melonDS-"$TAG"-*.zip)
+          if (( ${#files[@]} == 0 )); then
+            echo "::error::No Ubuntu packages to publish"
+            exit 1
+          fi
+          for file in "${files[@]}"; do test -s "$file"; done
+          sha256sum "${files[@]}" > SHA256SUMS.txt
+          sha256sum -c SHA256SUMS.txt
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # Do not replace an existing checksums file until final aggregation.
+            gh release upload "$TAG" "${files[@]}" --clobber
+            echo "Updated pre-existing snapshot with successful Ubuntu packages"
+          else
+            cat > notes.md <<EOF
+          Unofficial melonDS official-upstream snapshot built from commit `$SHA`.
+
+          Ubuntu packages are ready. Windows, macOS and BSD packages will be added if their builds succeed.
+          The release is a prerelease and its assets may be incomplete during this run.
+
+          Source: https://github.com/melonDS-emu/melonDS/tree/master
+          No game ROMs, firmware, or BIOS are included.
+          EOF
+            gh release create "$TAG" "${files[@]}" SHA256SUMS.txt \
+              --target "$SHA" --title "melonDS snapshot $TAG" \
+              --prerelease --notes-file notes.md
+          fi
+          echo "Early release contains ${#files[@]} Ubuntu packages" >> "$GITHUB_STEP_SUMMARY"
+
   release:
     name: Publish successful upstream-style packages
-    needs: [sync, windows, linux, macos, windows-arm64, linux-arm64, macos-x64, macos-universal, bsd]
+    needs: [sync, windows, linux, macos, windows-arm64, linux-arm64, macos-x64, macos-universal, bsd, publish-early]
     if: >-
       always() &&
       needs.sync.outputs.build == 'true' &&
-      needs.windows.result == 'success' &&
-      needs.linux.result == 'success' &&
-      needs.macos.result == 'success'
+      (needs.windows.result == 'success' ||
+       needs.linux.result == 'success' ||
+       needs.linux-arm64.result == 'success' ||
+       needs.macos.result == 'success' ||
+       needs.macos-x64.result == 'success' ||
+       needs.bsd.result == 'success')
     runs-on: ubuntu-latest
     timeout-minutes: 35
     permissions:
@@ -584,9 +658,6 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
-          test -s "melonDS-$TAG-Windows-x64.zip"
-          test -s "melonDS-$TAG-Linux-x64-Ubuntu22.04.tar.gz"
-          test -s "melonDS-$TAG-macOS-ARM64.app.zip"
           if gh release view "$TAG" >/dev/null 2>&1; then
             mkdir -p previous
             gh release download "$TAG" --dir previous --pattern 'melonDS-*'
@@ -598,7 +669,7 @@ jobs:
           fi
           shopt -s nullglob
           files=(melonDS-"$TAG"-*.zip melonDS-"$TAG"-*.tar.gz)
-          if (( ${#files[@]} < 3 )); then echo "::error::Missing core assets"; exit 1; fi
+          if (( ${#files[@]} == 0 )); then echo "::error::No successfully built assets"; exit 1; fi
           for f in "${files[@]}"; do test -s "$f"; done
           sha256sum "${files[@]}" > SHA256SUMS.txt
           sha256sum -c SHA256SUMS.txt

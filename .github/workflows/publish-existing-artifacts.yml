@@ -1,0 +1,106 @@
+name: Recover already-built melonDS packages into Releases
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - '.github/workflows/publish-existing-artifacts.yml'
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  publish:
+    name: Recover ${{ matrix.channel }} artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - channel: upstream
+            run_id: 41554168447
+            tag: melonds-upstream-1e654443e4c0
+            sha: 1e654443e4c0a54b40709c0208aa0eeba41e6142
+            pattern: 'melonds-*'
+            source: 'https://github.com/melonDS-emu/melonDS'
+          - channel: chn
+            run_id: 41555022936
+            tag: melonds-chn-cb2cc1d244b6
+            sha: cb2cc1d244b6a9d9ad61b48cd29c5a639c254c01
+            pattern: 'chn-*'
+            source: 'https://github.com/Wokann/melonDS_CHN'
+    steps:
+      - name: Fetch finished artifacts and existing Release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ matrix.run_id }}
+          TAG: ${{ matrix.tag }}
+          SHA: ${{ matrix.sha }}
+          PATTERN: ${{ matrix.pattern }}
+          SOURCE: ${{ matrix.source }}
+          CHANNEL: ${{ matrix.channel }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts dist
+          gh run download "$RUN_ID" --repo "$GH_REPO" --pattern "$PATTERN" --dir artifacts
+          count=0
+          while IFS= read -r -d '' file; do
+            cp -f "$file" "dist/$(basename "$file")"
+            count=$((count + 1))
+          done < <(find artifacts -type f \( -name "melonDS-$TAG-*.zip" -o -name "melonDS-$TAG-*.tar.gz" \) -print0)
+          if (( count == 0 )); then
+            echo "::error::No matching build packages found for run $RUN_ID"
+            find artifacts -maxdepth 3 -type f
+            exit 1
+          fi
+          cd dist
+          if gh release view "$TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
+            mkdir -p previous
+            gh release download "$TAG" --repo "$GH_REPO" --dir previous --pattern "melonDS-$TAG-*" || true
+            for old in previous/*; do
+              [[ -f "$old" ]] || continue
+              name="$(basename "$old")"
+              [[ -f "$name" ]] || cp "$old" "$name"
+            done
+          fi
+          shopt -s nullglob
+          files=(melonDS-"$TAG"-*.zip melonDS-"$TAG"-*.tar.gz)
+          if (( ${#files[@]} == 0 )); then
+            echo "::error::No staged packages after collection"
+            exit 1
+          fi
+          for file in "${files[@]}"; do test -s "$file"; done
+          sha256sum "${files[@]}" > SHA256SUMS.txt
+          sha256sum -c SHA256SUMS.txt
+          {
+            echo "# Unofficial melonDS $CHANNEL snapshot"
+            echo
+            echo "Source: $SOURCE"
+            echo "Exact upstream commit: \`$SHA\`"
+            echo
+            echo "## Available compiled packages"
+            for file in "${files[@]}"; do echo "- \`$file\`"; done
+            echo
+            echo "Recovered from successfully uploaded artifacts of Actions run $RUN_ID."
+            echo "Other platforms may still be compiling and will be added when successful."
+            echo "Files are unofficial pre-release builds; functionality is not yet smoke-tested."
+            echo "SHA256SUMS.txt contains the checksum of each currently uploaded package."
+            echo "Ubuntu TAR.GZ packages need compatible shared libraries."
+            echo "macOS binaries are not Apple notarized."
+            echo "No copyrighted ROMs, BIOS, or firmware included."
+          } > notes.md
+          if gh release view "$TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
+            gh release upload "$TAG" --repo "$GH_REPO" "${files[@]}" SHA256SUMS.txt --clobber
+            gh release edit "$TAG" --repo "$GH_REPO" --notes-file notes.md
+          else
+            gh release create "$TAG" --repo "$GH_REPO" "${files[@]}" SHA256SUMS.txt \
+              --target "$SHA" --title "melonDS $CHANNEL snapshot $TAG" \
+              --prerelease --notes-file notes.md
+          fi
+          echo "Recovered ${#files[@]} packages into release $TAG" >> "$GITHUB_STEP_SUMMARY"
+          gh release view "$TAG" --repo "$GH_REPO" --json url,assets --jq '{url,assets:[.assets[].name]}'

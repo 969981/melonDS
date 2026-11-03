@@ -1,0 +1,626 @@
+name: Sync official melonDS and release desktop snapshots
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+  push:
+    branches: [arm9cache2]
+    paths:
+      - '.github/workflows/upstream-sync-release.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: melonds-official-upstream-sync-release-v2
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Mirror official melonDS master
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: write
+    outputs:
+      sha: ${{ steps.sync.outputs.sha }}
+      tag: ${{ steps.sync.outputs.tag }}
+      build: ${{ steps.sync.outputs.build }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Fetch official upstream and update isolated mirror
+        id: sync
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          upstream="https://github.com/melonDS-emu/melonDS.git"
+          sha="$(timeout 90 git ls-remote --exit-code "$upstream" refs/heads/master | awk 'NR==1 {print $1}')"
+          if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Official upstream master is unavailable."
+            exit 1
+          fi
+          old="$(git ls-remote origin refs/heads/upstream-master | awk 'NR==1 {print $1}')"
+          if [[ "$old" != "$sha" ]]; then
+            git fetch --no-tags "$upstream" refs/heads/master
+            got="$(git rev-parse FETCH_HEAD)"
+            if [[ "$got" != "$sha" ]]; then
+              echo "::error::Source changed during fetch. Retry the next run."
+              exit 1
+            fi
+            if [[ -n "$old" ]]; then
+              git fetch --no-tags origin refs/heads/upstream-master
+              if ! git merge-base --is-ancestor "$old" "$sha"; then
+                echo "::error::Upstream history diverged. Will not rewrite upstream-master."
+                exit 1
+              fi
+            fi
+            # Only the dedicated mirror branch is changed. Existing historical branches remain untouched.
+            git push origin "$sha:refs/heads/upstream-master"
+            echo "Updated source mirror: $old -> $sha"
+          else
+            echo "Source mirror already current: $sha"
+          fi
+
+          tag="melonds-upstream-${sha:0:12}"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            if [[ "$GITHUB_EVENT_NAME" == "push" || "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+              echo "build=true" >> "$GITHUB_OUTPUT"
+              echo "Rebuilding snapshot on manual/workflow change trigger."
+            else
+              echo "build=false" >> "$GITHUB_OUTPUT"
+              echo "Existing release; skip scheduled rebuild without upstream changes."
+            fi
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "Building snapshot for upstream commit $sha"
+          fi
+          echo "Official source: $upstream" >> "$GITHUB_STEP_SUMMARY"
+          echo "Official SHA: $sha" >> "$GITHUB_STEP_SUMMARY"
+          echo "Snapshot tag: $tag" >> "$GITHUB_STEP_SUMMARY"
+
+  windows:
+    name: Windows x64 (official vcpkg preset)
+    needs: sync
+    if: needs.sync.outputs.build == 'true'
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 240
+    env:
+      MELONDS_GIT_BRANCH: master
+      MELONDS_GIT_HASH: ${{ needs.sync.outputs.sha }}
+      MELONDS_BUILD_PROVIDER: GitHub Actions (unofficial snapshot)
+      VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/vcpkg_cache,readwrite
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/cache@v4
+        with:
+          path: vcpkg_cache
+          key: melonds-vcpkg-win-x64-${{ hashFiles('vcpkg.json') }}
+          restore-keys: melonds-vcpkg-win-x64-
+      - name: Set up vcpkg (matching upstream)
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgJsonGlob: vcpkg.json
+      - name: Build using upstream CMake preset
+        uses: lukka/run-cmake@v10
+        with:
+          configurePreset: release-windows-x86_64
+          configurePresetAdditionalArgs: "['-DENABLE_DEBUG_DEPS=OFF', '-DMELONDS_EMBED_BUILD_INFO=ON']"
+          buildPreset: release-windows-x86_64
+      - name: Package Windows executable and license
+        shell: pwsh
+        env:
+          TAG: ${{ needs.sync.outputs.tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = 'build/release-windows-x86_64/melonDS.exe'
+          if (-not (Test-Path $exe)) { throw "Missing $exe" }
+          New-Item -Type Directory -Force -Path 'dist\windows' | Out-Null
+          Copy-Item $exe 'dist\windows\melonDS.exe'
+          Copy-Item LICENSE 'dist\windows\LICENSE'
+          Compress-Archive -Path 'dist\windows\*' -DestinationPath "dist\melonDS-$env:TAG-Windows-x64.zip" -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: melonds-windows-x64
+          path: dist/*.zip
+          retention-days: 7
+          if-no-files-found: error
+
+  linux:
+    name: Ubuntu x86_64 (Qt 6)
+    needs: sync
+    if: needs.sync.outputs.build == 'true'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    env:
+      MELONDS_GIT_BRANCH: master
+      MELONDS_GIT_HASH: ${{ needs.sync.outputs.sha }}
+      MELONDS_BUILD_PROVIDER: GitHub Actions (unofficial snapshot)
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+          persist-credentials: false
+      - name: Install official Ubuntu dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake ninja-build extra-cmake-modules libpcap0.8-dev libsdl2-dev libenet-dev \
+            qt6-base-dev qt6-base-private-dev qt6-multimedia-dev qt6-wayland \
+            libqt6svg6-dev libarchive-dev libzstd-dev libfaad-dev libfuse2
+      - name: Configure, compile and stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr -DMELONDS_EMBED_BUILD_INFO=ON
+          cmake --build build --parallel 3
+          test -x build/melonDS
+          DESTDIR="$PWD/AppDir" cmake --install build
+          test -x AppDir/usr/bin/melonDS
+      - name: Package Linux files (requires host system libraries)
+        shell: bash
+        env:
+          TAG: ${{ needs.sync.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp LICENSE AppDir/LICENSE
+          printf 'Unofficial melonDS upstream build for Ubuntu 22.04 x86_64.\nThis is not an AppImage. Install compatible Qt6, SDL2 and other runtime libraries.\nNo games, firmware or BIOS included.\n' > AppDir/README-REQUIREMENTS.txt
+          tar -czf "dist/melonDS-$TAG-Linux-x64-Ubuntu22.04.tar.gz" -C AppDir .
+          test -s "dist/melonDS-$TAG-Linux-x64-Ubuntu22.04.tar.gz"
+      - name: Build optional x86_64 AppImage
+        continue-on-error: true
+        shell: bash
+        env:
+          TAG: ${{ needs.sync.outputs.tag }}
+        run: |
+          set -euo pipefail
+          arch=x86_64
+          curl -fL --retry 3 -o "linuxdeploy-$arch.AppImage" "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-$arch.AppImage"
+          curl -fL --retry 3 -o "linuxdeploy-plugin-qt-$arch.AppImage" "https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-$arch.AppImage"
+          chmod +x linuxdeploy-*.AppImage
+          export EXTRA_PLATFORM_PLUGINS="libqwayland-egl.so;libqwayland-generic.so"
+          export EXTRA_QT_PLUGINS=waylandcompositor
+          export QMAKE=/usr/lib/qt6/bin/qmake
+          "./linuxdeploy-$arch.AppImage" --appdir AppDir --plugin qt --output appimage
+          ls melonDS*.AppImage
+          zip -j "dist/melonDS-$TAG-appimage-$arch.zip" melonDS*.AppImage LICENSE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: melonds-linux-x64
+          path: dist/*
+          retention-days: 7
+          if-no-files-found: error
+
+  macos:
+    name: macOS Apple Silicon (upstream vcpkg preset)
+    needs: sync
+    if: needs.sync.outputs.build == 'true'
+    runs-on: macos-15
+    timeout-minutes: 240
+    env:
+      MELONDS_GIT_BRANCH: master
+      MELONDS_GIT_HASH: ${{ needs.sync.outputs.sha }}
+      MELONDS_BUILD_PROVIDER: GitHub Actions (unofficial snapshot)
+      VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/vcpkg_cache,readwrite
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+          persist-credentials: false
+      - name: Install upstream macOS packaging dependencies
+        run: |
+          brew install autoconf automake autoconf-archive libtool python-setuptools
+      - name: Set up CMake
+        uses: lukka/get-cmake@latest
+      - uses: actions/cache@v4
+        with:
+          path: vcpkg_cache
+          key: melonds-vcpkg-macos-arm64-${{ hashFiles('vcpkg.json') }}
+          restore-keys: melonds-vcpkg-macos-arm64-
+      - name: Set up vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgJsonGlob: vcpkg.json
+      - name: Build using upstream macOS preset
+        uses: lukka/run-cmake@v10
+        with:
+          configurePreset: release-mac-arm64
+          configurePresetAdditionalArgs: "['-DMELONDS_EMBED_BUILD_INFO=ON']"
+          buildPreset: release-mac-arm64
+      - name: Package Apple Silicon application
+        shell: bash
+        env:
+          TAG: ${{ needs.sync.outputs.tag }}
+        run: |
+          set -euo pipefail
+          app="build/release-mac-arm64/melonDS.app"
+          test -d "$app"
+          codesign --force --deep --sign - "$app"
+          mkdir -p dist
+          (cd build/release-mac-arm64 && zip -qr -y "../../dist/melonDS-$TAG-macOS-ARM64.app.zip" melonDS.app)
+          test -s "dist/melonDS-$TAG-macOS-ARM64.app.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: melonds-macos-arm64
+          path: dist/*.zip
+          retention-days: 7
+          if-no-files-found: error
+
+  windows-arm64:
+    name: Windows ARM64 (official vcpkg preset)
+    needs: sync
+    if: needs.sync.outputs.build == 'true'
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 240
+    env:
+      MELONDS_GIT_BRANCH: master
+      MELONDS_GIT_HASH: ${{ needs.sync.outputs.sha }}
+      MELONDS_BUILD_PROVIDER: GitHub Actions (unofficial snapshot)
+      VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/vcpkg_cache,readwrite
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/cache@v4
+        with:
+          path: vcpkg_cache
+          key: melonds-vcpkg-win-arm64-${{ hashFiles('vcpkg.json') }}
+          restore-keys: melonds-vcpkg-win-arm64-
+      - name: Set up vcpkg (matching upstream)
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgJsonGlob: vcpkg.json
+      - name: Build using upstream CMake preset
+        uses: lukka/run-cmake@v10
+        with:
+          configurePreset: release-windows-arm64
+          configurePresetAdditionalArgs: "['-DENABLE_DEBUG_DEPS=OFF', '-DMELONDS_EMBED_BUILD_INFO=ON']"
+          buildPreset: release-windows-arm64
+      - name: Package Windows executable and license
+        shell: pwsh
+        env:
+          TAG: ${{ needs.sync.outputs.tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = 'build/release-windows-arm64/melonDS.exe'
+          if (-not (Test-Path $exe)) { throw "Missing $exe" }
+          New-Item -Type Directory -Force -Path 'dist\windows-arm64' | Out-Null
+          Copy-Item $exe 'dist\windows-arm64\melonDS.exe'
+          Copy-Item LICENSE 'dist\windows-arm64\LICENSE'
+          Compress-Archive -Path 'dist\windows-arm64\*' -DestinationPath "dist\melonDS-$env:TAG-Windows-ARM64.zip" -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: melonds-windows-arm64
+          path: dist/*.zip
+          retention-days: 7
+          if-no-files-found: error
+
+  linux-arm64:
+    name: Ubuntu aarch64 (Qt 6)
+    needs: sync
+    if: needs.sync.outputs.build == 'true'
+    runs-on: ubuntu-22.04-arm
+    timeout-minutes: 180
+    env:
+      MELONDS_GIT_BRANCH: master
+      MELONDS_GIT_HASH: ${{ needs.sync.outputs.sha }}
+      MELONDS_BUILD_PROVIDER: GitHub Actions (unofficial snapshot)
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+          persist-credentials: false
+      - name: Install official Ubuntu dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake ninja-build extra-cmake-modules libpcap0.8-dev libsdl2-dev libenet-dev \
+            qt6-base-dev qt6-base-private-dev qt6-multimedia-dev qt6-wayland \
+            libqt6svg6-dev libarchive-dev libzstd-dev libfaad-dev libfuse2
+      - name: Configure, compile and stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr -DMELONDS_EMBED_BUILD_INFO=ON
+          cmake --build build --parallel 3
+          test -x build/melonDS
+          DESTDIR="$PWD/AppDir" cmake --install build
+          test -x AppDir/usr/bin/melonDS
+      - name: Package Linux files (requires host system libraries)
+        shell: bash
+        env:
+          TAG: ${{ needs.sync.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp LICENSE AppDir/LICENSE
+          printf 'Unofficial melonDS upstream build for Ubuntu 22.04 aarch64.\nThis is not an AppImage. Install compatible Qt6, SDL2 and other runtime libraries.\nNo games, firmware or BIOS included.\n' > AppDir/README-REQUIREMENTS.txt
+          tar -czf "dist/melonDS-$TAG-ubuntu-aarch64.tar.gz" -C AppDir .
+          test -s "dist/melonDS-$TAG-ubuntu-aarch64.tar.gz"
+      - name: Build optional aarch64 AppImage
+        continue-on-error: true
+        shell: bash
+        env:
+          TAG: ${{ needs.sync.outputs.tag }}
+        run: |
+          set -euo pipefail
+          arch=aarch64
+          curl -fL --retry 3 -o "linuxdeploy-$arch.AppImage" "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-$arch.AppImage"
+          curl -fL --retry 3 -o "linuxdeploy-plugin-qt-$arch.AppImage" "https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-$arch.AppImage"
+          chmod +x linuxdeploy-*.AppImage
+          export EXTRA_PLATFORM_PLUGINS="libqwayland-egl.so;libqwayland-generic.so"
+          export EXTRA_QT_PLUGINS=waylandcompositor
+          export QMAKE=/usr/lib/qt6/bin/qmake
+          "./linuxdeploy-$arch.AppImage" --appdir AppDir --plugin qt --output appimage
+          ls melonDS*.AppImage
+          zip -j "dist/melonDS-$TAG-appimage-$arch.zip" melonDS*.AppImage LICENSE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: melonds-linux-arm64
+          path: dist/*
+          retention-days: 7
+          if-no-files-found: error
+
+  macos-x64:
+    name: macOS Intel (upstream vcpkg preset)
+    needs: sync
+    if: needs.sync.outputs.build == 'true'
+    runs-on: macos-15
+    timeout-minutes: 240
+    env:
+      MELONDS_GIT_BRANCH: master
+      MELONDS_GIT_HASH: ${{ needs.sync.outputs.sha }}
+      MELONDS_BUILD_PROVIDER: GitHub Actions (unofficial snapshot)
+      VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/vcpkg_cache,readwrite
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+          persist-credentials: false
+      - name: Install upstream macOS packaging dependencies
+        run: |
+          brew install autoconf automake autoconf-archive libtool python-setuptools
+      - name: Set up CMake
+        uses: lukka/get-cmake@latest
+      - uses: actions/cache@v4
+        with:
+          path: vcpkg_cache
+          key: melonds-vcpkg-macos-x64-${{ hashFiles('vcpkg.json') }}
+          restore-keys: melonds-vcpkg-macos-x64-
+      - name: Set up vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgJsonGlob: vcpkg.json
+      - name: Build using upstream macOS preset
+        uses: lukka/run-cmake@v10
+        with:
+          configurePreset: release-mac-x86_64
+          configurePresetAdditionalArgs: "['-DMELONDS_EMBED_BUILD_INFO=ON']"
+          buildPreset: release-mac-x86_64
+      - name: Package Intel macOS application
+        shell: bash
+        env:
+          TAG: ${{ needs.sync.outputs.tag }}
+        run: |
+          set -euo pipefail
+          app="build/release-mac-x86_64/melonDS.app"
+          test -d "$app"
+          codesign --force --deep --sign - "$app"
+          mkdir -p dist
+          (cd build/release-mac-x86_64 && zip -qr -y "../../dist/melonDS-$TAG-macOS-x64.app.zip" melonDS.app)
+          test -s "dist/melonDS-$TAG-macOS-x64.app.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: melonds-macos-x64
+          path: dist/*.zip
+          retention-days: 7
+          if-no-files-found: error
+
+
+  macos-universal:
+    name: macOS Universal (x64 + ARM64)
+    needs: [sync, macos, macos-x64]
+    if: needs.macos.result == 'success' && needs.macos-x64.result == 'success'
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: melonds-macos-arm64
+          path: arm
+      - uses: actions/download-artifact@v4
+        with:
+          name: melonds-macos-x64
+          path: intel
+      - name: Merge native binaries and package
+        shell: bash
+        env:
+          TAG: ${{ needs.sync.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p arm/app intel/app dist/bundle
+          unzip -q arm/*.zip -d arm/app
+          unzip -q intel/*.zip -d intel/app
+          cp -a arm/app/melonDS.app dist/bundle/melonDS.app
+          lipo -create intel/app/melonDS.app/Contents/MacOS/melonDS arm/app/melonDS.app/Contents/MacOS/melonDS -output dist/bundle/melonDS.app/Contents/MacOS/melonDS
+          archs="$(lipo -archs dist/bundle/melonDS.app/Contents/MacOS/melonDS)"
+          echo "$archs"
+          [[ "$archs" == *x86_64* && "$archs" == *arm64* ]]
+          codesign --force --deep --sign - dist/bundle/melonDS.app
+          (cd dist/bundle && zip -qry -y "../melonDS-$TAG-macOS-universal.zip" melonDS.app)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: melonds-macos-universal
+          path: dist/*.zip
+          retention-days: 7
+          if-no-files-found: error
+
+  bsd:
+    name: ${{ matrix.os_name }} x86_64
+    needs: sync
+    if: needs.sync.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: freebsd
+            os_name: FreeBSD
+            prepare_vm: service lockd onestart
+            install_deps: >-
+              pkg install -y cmake kf6-extra-cmake-modules pkgconf ninja
+              qt6-base qt6-multimedia qt6-svg sdl2 libarchive zstd enet faad2
+          - os: netbsd
+            os_name: NetBSD
+            prepare_vm: |
+              /usr/sbin/pkg_add pkgin curl
+              mach=$(uname -m | sed "s/evbarm/evbarm-$(uname -p)/")
+              for set in xbase xcomp; do
+                curl -sL ${PKG_PATH%%/pkgsrc*}/NetBSD/NetBSD-$(uname -r
+                  )/$mach/binary/sets/$set.tar.xz | tar xJpf - -C /
+              done
+            install_deps: >-
+              pkgin -y install cmake extra-cmake-modules pkgconf
+              ninja-build qt6-qtbase qt6-qtmultimedia qt6-qtsvg SDL2
+              libarchive zstd enet faad2
+          - os: openbsd
+            os_name: OpenBSD
+            prepare_vm: 'true'
+            install_deps: >-
+              pkg_add -v cmake kf6-extra-cmake-modules pkgconf ninja
+              qt6-qtbase qt6-qtmultimedia qt6-qtsvg sdl2 libarchive zstd enet faad
+    env:
+      MELONDS_GIT_BRANCH: master
+      MELONDS_GIT_HASH: ${{ needs.sync.outputs.sha }}
+      MELONDS_BUILD_PROVIDER: GitHub Actions (unofficial snapshot)
+    defaults:
+      run:
+        shell: ${{ matrix.os }} {0}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+          persist-credentials: false
+      - name: Start ${{ matrix.os_name }} VM
+        uses: jenseng/dynamic-uses@v1
+        with:
+          uses: vmactions/${{ matrix.os }}-vm@v1
+          with: >-
+            {
+              "arch": "x86_64",
+              "envs": "MELONDS_GIT_BRANCH MELONDS_GIT_HASH MELONDS_BUILD_PROVIDER",
+              "prepare": ${{ toJSON(matrix.prepare_vm) }},
+              "sync": "nfs",
+              "usesh": "true"
+            }
+      - name: Install dependencies
+        run: ${{ matrix.install_deps }}
+      - name: Configure and compile
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          cmake -B build -G Ninja -DMELONDS_EMBED_BUILD_INFO=ON
+          cmake --build build
+          test -f build/melonDS
+      - name: Package BSD executable
+        shell: bash
+        env:
+          TAG: ${{ needs.sync.outputs.tag }}
+          OS: ${{ matrix.os }}
+        run: |
+          set -euo pipefail
+          test -s build/melonDS
+          mkdir -p dist/stage
+          cp build/melonDS dist/stage/melonDS
+          cp LICENSE dist/stage/LICENSE
+          (cd dist/stage && zip -q "../melonDS-$TAG-$OS-x86_64.zip" melonDS LICENSE)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: melonds-bsd-${{ matrix.os }}
+          path: dist/*.zip
+          retention-days: 7
+          if-no-files-found: error
+
+  release:
+    name: Publish successful upstream-style packages
+    needs: [sync, windows, linux, macos, windows-arm64, linux-arm64, macos-x64, macos-universal, bsd]
+    if: >-
+      always() &&
+      needs.sync.outputs.build == 'true' &&
+      needs.windows.result == 'success' &&
+      needs.linux.result == 'success' &&
+      needs.macos.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: melonds-*
+          path: dist
+          merge-multiple: true
+      - name: Verify outputs and update release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.sync.outputs.tag }}
+          SHA: ${{ needs.sync.outputs.sha }}
+        run: |
+          set -euo pipefail
+          cd dist
+          test -s "melonDS-$TAG-Windows-x64.zip"
+          test -s "melonDS-$TAG-Linux-x64-Ubuntu22.04.tar.gz"
+          test -s "melonDS-$TAG-macOS-ARM64.app.zip"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            mkdir -p previous
+            gh release download "$TAG" --dir previous --pattern 'melonDS-*'
+            for p in previous/*; do
+              [[ -f "$p" ]] || continue
+              name="$(basename "$p")"
+              [[ -f "$name" ]] || cp "$p" "$name"
+            done
+          fi
+          shopt -s nullglob
+          files=(melonDS-"$TAG"-*.zip melonDS-"$TAG"-*.tar.gz)
+          if (( ${#files[@]} < 3 )); then echo "::error::Missing core assets"; exit 1; fi
+          for f in "${files[@]}"; do test -s "$f"; done
+          sha256sum "${files[@]}" > SHA256SUMS.txt
+          sha256sum -c SHA256SUMS.txt
+          {
+            echo "Unofficial melonDS snapshot from official upstream master commit \`$SHA\`."
+            echo
+            echo "## Available downloads"
+            for f in "${files[@]}"; do echo "- \`$f\`"; done
+            echo
+            echo "Only successfully built packages are listed. Optional platform failures do not block core builds."
+            echo "Ubuntu TAR.GZ archives require compatible system libraries; AppImage ZIPs contain AppImage binaries."
+            echo "macOS applications are ad-hoc signed, not notarized."
+            echo "SHA256SUMS.txt covers all packages listed above."
+            echo "Source: https://github.com/melonDS-emu/melonDS"
+            echo "No game ROMs, copyrighted BIOS, or firmware included."
+          } > release-notes.md
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${files[@]}" SHA256SUMS.txt --clobber
+            gh release edit "$TAG" --notes-file release-notes.md
+          else
+            gh release create "$TAG" "${files[@]}" SHA256SUMS.txt \
+              --target "$SHA" --title "melonDS snapshot $TAG" \
+              --prerelease --notes-file release-notes.md
+          fi
+          echo "Published ${#files[@]} archives" >> "$GITHUB_STEP_SUMMARY"
